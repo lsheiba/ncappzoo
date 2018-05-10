@@ -11,10 +11,11 @@
 # *******************************************************
 
 import sys
-graph_folder="../../tensorflow/inception_v3/"
+graph_folder="../../tensorflow/inception/model/v1/"
 images_folder = "../../data/images/"
 labels_file = "../../data/ilsvrc12/synset_words.txt"
 mean_file = "../../data/ilsvrc12/ilsvrc_2012_mean.npy"
+reqsize = int( 224 )
 
 if sys.version_info.major < 3 or sys.version_info.minor < 4:
     print("Please using python3.4 or greater!")
@@ -24,22 +25,14 @@ if len(sys.argv) > 1:
     graph_folder = sys.argv[1]
     if len(sys.argv) > 2:
       images_folder = sys.argv[2]
+      if len(sys.argv) > 3:
+        reqsize = int(sys.argv[3])
 else:
     print("WARNING: using", graph_folder, "for graph file")
     print("WARNING: using", images_folder, "for images dir")
+    print("WARNING: using default image dimensions of 224x224")
     print("Run with python3 demo_ncs.py [graph_folder] [images_director] to change")
     input("Press enter to continue")
-
-# ****************************************************************
-
-# *****************************************************************
-# Install prerequisites
-# *****************************************************************
-from os import listdir, system, getpid
-
-print("\n\nInstalling prerequisites\n\n")
-system("sudo -H apt-get install python3-tk")
-system("(cd " + graph_folder + "; make compile)")
 
 # *****************************************************************
 
@@ -54,6 +47,7 @@ from queue import Queue
 from threading import Thread
 import re
 from tkinter import *
+from os import listdir, system, getpid
 
 mvnc.SetGlobalOption(mvnc.GlobalOption.LOG_LEVEL, 2)
 
@@ -92,7 +86,7 @@ std = 1/128
 ##RR  categories = []
 ##RR  categories = numpy.loadtxt(labels_file, str, delimiter="\t")
 categories = []
-with open(graph_folder + 'categories.txt', 'r') as f:
+with open(graph_folder + 'labels.txt', 'r') as f:
     for line in f:
         cat = line.split('\n')[0]
         if cat != 'classes':
@@ -106,10 +100,6 @@ with open(graph_folder + 'categories.txt', 'r') as f:
 imgarr = []
 imgarr_orig = []
 onlyfiles = [f for f in listdir(images_folder) if isfile(join(images_folder, f))]
-
-#Load image size
-with open(graph_folder + 'inputsize.txt', 'r') as f:
-    reqsize = int(f.readline().split('\n')[0])
 
 # Only load the first 250 files, 
 # so that we don"t exceed availible resources

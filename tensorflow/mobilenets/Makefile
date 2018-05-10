@@ -1,96 +1,126 @@
 
-ifneq ($(findstring movidius, $(PYTHONPATH)), movidius)
-	export PYTHONPATH:=/opt/movidius/caffe/python:/opt/movidius/mvnc/python:$(PYTHONPATH)
+VERSION?=v1
+DEPTH?=1.0
+IMGSIZE?=224
+MODEL_CKPT=mobilenet_$(VERSION)_$(DEPTH)_$(IMGSIZE)
+MODEL_CKPT_TAR=$(MODEL_CKPT)_2017_06_14.tar.gz
+
+# MobileNet model names as defined in https://github.com/tensorflow/models/blob/master/research/slim/nets/nets_factory.py
+ifeq ($(DEPTH),1.0) 
+MODEL_NAME=mobilenet_$(VERSION)
+else ifeq ($(DEPTH),0.75)
+MODEL_NAME=mobilenet_$(VERSION)_075
+else ifeq ($(DEPTH),0.50)
+MODEL_NAME=mobilenet_$(VERSION)_050
+else ifeq ($(DEPTH),0.25)
+MODEL_NAME=mobilenet_$(VERSION)_025
 endif
 
-NCCOMPILE = mvNCCompile
-NCPROFILE = mvNCProfile
-NCCHECK   = mvNCCheck
+OUTPUT_NODE_NAME=MobilenetV1/Predictions/Reshape_1
 
-.IGNORE: profile check compile
+YELLOW='\033[1;33m'
+NOCOLOR='\033[0m'
 
-IMGCLASS ?=1.0
-IMGSIZE ?=224
 
-TF_MODEL = https://raw.githubusercontent.com/tensorflow/models/master/research/slim/nets/mobilenet_v1.py
-WEIGHTS_FILENAME = mobilenet_v1_$(IMGCLASS)_$(IMGSIZE)_2017_06_14.tar.gz
-GET_WEIGHTS = (wget http://download.tensorflow.org/models/${WEIGHTS_FILENAME} && tar zxf ${WEIGHTS_FILENAME} && rm ${WEIGHTS_FILENAME})
-
-MODEL_FILENAME = output/mobilenet_v1_$(IMGCLASS)_$(IMGSIZE).meta
-CONV_SCRIPT = ./save_session.py
-
-INPUT_NODE_FLAG = -in=input
-OUTPUT_NODE_FLAG = -on=MobilenetV1/Predictions/Softmax
 
 .PHONY: all
-all: profile check compile
+all: profile
 
-.PHONY: prereqs
-prereqs:
-	(cd ../../data/ilsvrc12; make)
-	@sed -i 's/\r//' run.py
-	@chmod +x run.py
+PROJECT_DIR = $(CURDIR)
+ZOO_RELATIVE_TF_SRC_PROJ = ../tf_src
+ZOO_RELATIVE_TF_MODELS_PROJ = ../tf_models
+ZOO_TF_SRC_PATH = ${PROJECT_DIR}/${ZOO_RELATIVE_TF_SRC_PROJ}/tensorflow
+ZOO_TF_MODELS_PATH = ${PROJECT_DIR}/${ZOO_RELATIVE_TF_MODELS_PROJ}/models
 
-.PHONY: profile
-profile: weights
-	${NCPROFILE} -s 12 ${MODEL_FILENAME} ${INPUT_NODE_FLAG} ${OUTPUT_NODE_FLAG}
 
-.PHONY: browse_profile
-browse_profile: weights profile
-	@if [ -e output_report.html ] ; \
-	then \
-		firefox output_report.html & \
-	else \
-		@echo "***\nError - output_report.html not found" ; \
-	fi ; 
+# Checks if TF_MODELS_PATH is set.  If it isn't set then will make the
+# tf_models project in the ncappzoo/tensorflow/tf_models directory.
+check_model:
+ifndef TF_MODELS_PATH
+	@echo "TF_MODELS_PATH not set, making tf_models";
+	(cd ../tf_models; make all; cd ${PROJECT_DIR})
+	$(eval TF_MODELS_PATH = ${ZOO_TF_MODELS_PATH})
+	@echo "TF_MODELS_PATH is ${TF_MODELS_PATH}" ;
+else
+	@echo "TF_MODELS_PATH is ${TF_MODELS_PATH}" ;
+endif
 
-.PHONY: weights
-weights:
-	@sed -i 's/\r//' ${CONV_SCRIPT}
-	@chmod +x ${CONV_SCRIPT}
-	@test -f mobilenet_v1.py || wget $(TF_MODEL)
-	@test -f ${MODEL_FILENAME} || (${GET_WEIGHTS} && ${CONV_SCRIPT}  $(IMGCLASS) $(IMGSIZE))
+# Checks if TF_SRC_PATH is set.  If it isn't set then will make the
+# tf_models project in the ncappzoo/tensorflow/tf_src directory.
+check_tf:
+ifndef TF_SRC_PATH
+	@echo "TF_SRC_PATH not set, making tf_src";
+	(cd ../tf_src; make all; cd ${PROJECT_DIR})
+	$(eval TF_SRC_PATH=${ZOO_TF_SRC_PATH})
+	@echo "TF_SRC_PATH is ${TF_SRC_PATH}" ;
+else
+	@echo "TF_SRC_PATH is ${TF_SRC_PATH}" ;
+endif
+
+.PHONY: checkpoint
+checkpoint:
+	@echo $(YELLOW)"\nDownloading checkpoint files..."$(NOCOLOR)
+	(mkdir -p model)
+	(cd model; wget -nc http://download.tensorflow.org/models/$(MODEL_CKPT_TAR);)
+	(cd model; tar -xvf $(MODEL_CKPT_TAR);)
+
+.PHONY: export
+export: check_model
+	@echo $(YELLOW)"\nExporting GraphDef file..."$(NOCOLOR)
+	(cd model; python3 $(TF_MODELS_PATH)/research/slim/export_inference_graph.py \
+		--alsologtostderr \
+		--model_name=$(MODEL_NAME) \
+		--batch_size=1 \
+		--dataset_name=imagenet \
+		--image_size=$(IMGSIZE) \
+		--output_file=$(MODEL_CKPT).pb;)
+
+.PHONY: freeze
+freeze: check_tf checkpoint export
+	@echo $(YELLOW)"\nFreezing model for inference..."$(NOCOLOR)
+	(cd model; python3 $(TF_SRC_PATH)/tensorflow/python/tools/freeze_graph.py \
+		--input_graph=$(MODEL_CKPT).pb \
+		--input_binary=true \
+		--input_checkpoint=$(MODEL_CKPT).ckpt \
+		--output_graph=$(MODEL_CKPT)_frozen.pb \
+		--output_node_name=$(OUTPUT_NODE_NAME);)
 
 .PHONY: compile
-compile: weights
-	${NCCOMPILE} -s 12 ${MODEL_FILENAME} ${INPUT_NODE_FLAG} ${OUTPUT_NODE_FLAG}
+compile: freeze
+	@echo $(YELLOW)"\nCompiling model to Movidius graph..."$(NOCOLOR)
+	(cd model; mvNCCompile -s 12 $(MODEL_CKPT)_frozen.pb -in=input -on=$(OUTPUT_NODE_NAME);)
+	@echo $(YELLOW)"Movidius graph generated! You can run inferences using ncappzoo/apps/image-classifier project.\n"$(NOCOLOR)
+
+.PHONY: profile
+profile: freeze
+	@echo $(YELLOW)"\nProfiling the model..."$(NOCOLOR)
+	(cd model; mvNCProfile -s 12 $(MODEL_CKPT)_frozen.pb -in=input -on=$(OUTPUT_NODE_NAME);)
+	@echo $(YELLOW)"Movidius graph generated! You can run inferences using ncappzoo/apps/image-classifier project.\n"$(NOCOLOR)
 
 .PHONY: check
-check: weights
-	-${NCCHECK} -s 12 ${MODEL_FILENAME} ${INPUT_NODE_FLAG} ${OUTPUT_NODE_FLAG} -i ../../data/images/cat.jpg -id 829 -S 2 -M 128 -cs 0,1,2
+check: freeze
+	@echo $(YELLOW)"\nComparing results with standard Tensorflow..."$(NOCOLOR)
+	(cd model; mvNCCheck -s 12 $(MODEL_CKPT)_frozen.pb -in=input -on=$(OUTPUT_NODE_NAME);)
+	@echo $(YELLOW)"Movidius graph generated! You can run inferences using ncappzoo/apps/image-classifier project.\n"$(NOCOLOR)
 
 .PHONY: run
 run: compile
-	./run.py $(IMGCLASS) $(IMGSIZE)
-
-.PHONY: run_py
-run_py: compile
-	./run.py $(IMGCLASS) $(IMGSIZE)
+	@echo $(YELLOW)"\nRunning inferences using image-classifier project..."$(NOCOLOR)
+	(python3 ../../apps/image-classifier/image-classifier.py --graph ./model/graph --dim $(IMGSIZE) $(IMGSIZE) --mean 127.5 --scale 0.00789 --colormode "RGB" --labels ./model/labels.txt --image ../../data/images/pic_053.jpg)
 
 .PHONY: help
 help:
-	@echo "possible make targets: ";
-	@echo "  make help - shows this message";
-	@echo "  make all - makes the following: prototxt, profile, compile, check, cpp, run_py, run_cpp";
-	@echo "  make weights - downloads the trained model";
-	@echo "  make compile - runs SDK compiler tool to compile the NCS graph file for the network";
-	@echo "  make check - runs SDK checker tool to verify an NCS graph file";
-	@echo "  make profile - runs the SDK profiler tool to profile the network creating output_report.html";
-	@echo "  make browse_profile - runs the SDK profiler tool and brings up report in browser.";
-	@echo "  make run_py - runs the run.py python example program";
-	@echo "  make clean - removes all created content"
+	@echo $(YELLOW)"\nPossible make targets: "$(NOCOLOR);
+	@echo "  make help - Shows this message.";
+	@echo "  make - Builds all dependencies, but does not run this program.";
+	@echo "  make checkpoint - Downloads pre-trained checkpoint files.;"
+	@echo "  make export - Export the neural network model for inference.";
+	@echo "  make freeze - Freeze the neural network model for inference.";
+	@echo "  make compile - Convert the frozen model into Movidius graph file.";
+	@echo "  make check - Compare inference results with that of TensorFlow running on CPU/GPU.";
+	@echo "  make profile - Run the model on NCS and extract complexity, bandwidth and execution time for each layer.";
 
-
-clean: 
-	@rm -f output.gv
-	@rm -f output.gv.svg
-	@rm -f output_report.html
-	@rm -f output_expected.npy
-	@rm -f *.ckpt
-	@rm -f output_result.npy
-	@rm -f output_val.csv
-	@rm -rf output
-	@rm -rf mobilenet*.ckpt.*
-	@rm -f graph
-	@rm -f mobilenet_v1.py*
-	@rm -f *.gz
+.PHONY: clean
+clean:
+	@echo $(YELLOW)"\nMaking clean..."$(NOCOLOR);
+	rm -rf model
